@@ -1,0 +1,5 @@
+tests/build/
+.pio/
+__pycache__/
+*.gif
+out/

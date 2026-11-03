@@ -23,6 +23,15 @@ Motor numbering and spin directions (seen from ABOVE). Diagonals spin the same w
 
 A CCW propeller pushes the body round CW (reaction torque), i.e. towards +yaw.
 
+Tests performed by the self-test:
+    - Hover: runs four motors at the calculated hover throttle for 5 seconds and checks position, velocity, and attitude drift.
+    - Free-fall: turns all motors off for 0.5 seconds and compares downward displacement with 0.5*g*t^2.
+    - Torque direction: applies differential motor thrust for yaw, roll, and pitch and verifies the expected body-rate sign.
+    - Quaternion normalisation: checks that the integrated attitude quaternion still has unit length.
+    - Sensor statistics: collects noisy IMU samples and checks gyro bias/noise plus accelerometer noise and gravity.
+    The --sweep option repeats these checks at thrust-to-weight ratios of
+    1.5, 2.0, and 3.0.
+
 Run:
     python quad_sim.py              self-test (the SW-1 pass checks)
     python quad_sim.py --table      print the motor table for your notes
@@ -52,17 +61,21 @@ MOTORS = (
 
 @dataclass
 class Params:
-    mass: float = 0.050            # kg (replace with your weighed all-up weight)
-    ixx: float = 2.0e-5            # kg m^2 (roll)  - refine later
-    iyy: float = 2.0e-5            # kg m^2 (pitch) - refine later
-    izz: float = 3.0e-5            # kg m^2 (yaw)   - assumption, refine later
+    mass: float = 0.050            # kg (total mass)
+    ixx: float = 2.0e-5            # kg m^2 (roll)  (placeholder)
+    iyy: float = 2.0e-5            # kg m^2 (pitch) (placeholder)
+    izz: float = 3.0e-5            # kg m^2 (yaw)   (placeholder)
+    
     diagonal: float = 0.095        # m, motor-to-motor diagonal (QX95 frame)
+    
     thrust_max_gf: float = 15.0    # gram-force per motor at full throttle (placeholder)
     tau_motor: float = 0.030       # s, motor + prop thrust lag
     km: float = 0.010              # m, yaw reaction torque per newton of thrust (placeholder)
+    
     gyro_sigma_dps: float = 0.5    # deg/s, white noise per sample
     gyro_bias_max_dps: float = 1.0  # deg/s, constant bias drawn uniformly in +-this per axis
     accel_sigma: float = 0.1       # m/s^2, white noise per sample
+    
     dt: float = 0.001              # s, 1 kHz
 
     @property
@@ -72,28 +85,34 @@ class Params:
 
     @property
     def thrust_max_n(self) -> float:
+        """Return the maximum thrust of one motor in newtons."""
         return self.thrust_max_gf * 1e-3 * G
 
     @property
     def hover_thrust_n(self) -> float:
+        """Return the per-motor thrust required to balance the vehicle's weight."""
         return self.mass * G / 4.0
 
     @property
     def hover_throttle(self) -> float:
+        """Return the throttle fraction needed for steady hover."""
         return self.hover_thrust_n / self.thrust_max_n
 
     @property
     def thrust_to_weight(self) -> float:
+        """Return the vehicle's total maximum thrust divided by its weight."""
         return 4.0 * self.thrust_max_n / (self.mass * G)
 
     @classmethod
     def from_thrust_to_weight(cls, tw: float, **kw) -> "Params":
+        """Build parameters whose motor capacity matches the requested thrust ratio."""
         p = cls(**kw)
         p.thrust_max_gf = tw * p.mass * 1000.0 / 4.0
         return p
 
 
 def quat_mult(a, b):
+    """Multiply two scalar-first quaternions and return their product."""
     aw, ax, ay, az = a
     bw, bx, by, bz = b
     return np.array([
@@ -105,7 +124,7 @@ def quat_mult(a, b):
 
 
 def quat_to_dcm(q):
-    """Rotation matrix body -> world."""
+    """Convert a body-to-world scalar-first quaternion to a direction cosine matrix."""
     w, x, y, z = q
     return np.array([
         [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
@@ -115,6 +134,7 @@ def quat_to_dcm(q):
 
 
 def euler_to_quat(roll, pitch, yaw):
+    """Convert roll, pitch, and yaw Euler angles in radians to a quaternion."""
     cr, sr = math.cos(roll / 2), math.sin(roll / 2)
     cp, sp = math.cos(pitch / 2), math.sin(pitch / 2)
     cy, sy = math.cos(yaw / 2), math.sin(yaw / 2)
@@ -127,6 +147,7 @@ def euler_to_quat(roll, pitch, yaw):
 
 
 def quat_to_euler(q):
+    """Convert a scalar-first quaternion to roll, pitch, and yaw in radians."""
     w, x, y, z = q
     roll = math.atan2(2 * (w * x + y * z), 1 - 2 * (x * x + y * y))
     pitch = math.asin(max(-1.0, min(1.0, 2 * (w * y - z * x))))
@@ -138,6 +159,7 @@ class Quad:
     """Rigid-body quadcopter stepped with RK4 at params.dt, commands held for each step."""
 
     def __init__(self, params: Params | None = None, seed: int = 0):
+        """Initialise the vehicle model, deterministic noise source, and zero-time state."""
         self.p = params or Params()
         self.rng = np.random.default_rng(seed)
         a = self.p.arm
@@ -151,7 +173,7 @@ class Quad:
     # ------------------------------------------------------------------ state
     def reset(self, pos=(0, 0, 0), vel=(0, 0, 0), euler_deg=(0, 0, 0),
               rates_dps=(0, 0, 0), motors="hover"):
-        """motors: 'hover' starts each motor at hover thrust, 'off' starts at zero thrust."""
+        """Set the vehicle state and fixed gyro bias; motors start at hover or zero thrust."""
         q = euler_to_quat(*np.radians(euler_deg))
         T0 = self.p.hover_thrust_n if motors == "hover" else 0.0
         self.s = np.concatenate([
@@ -162,21 +184,37 @@ class Quad:
         self.t = 0.0
 
     @property
-    def pos(self): return self.s[0:3]
+    def pos(self):
+        """Return the vehicle position in world NED coordinates."""
+        return self.s[0:3]
+
     @property
-    def vel(self): return self.s[3:6]
+    def vel(self):
+        """Return the vehicle velocity in world NED coordinates."""
+        return self.s[3:6]
+
     @property
-    def quat(self): return self.s[6:10]
+    def quat(self):
+        """Return the body-to-world orientation quaternion."""
+        return self.s[6:10]
+
     @property
-    def rates(self): return self.s[10:13]          # body rates p, q, r (rad/s)
+    def rates(self):
+        """Return body angular rates p, q, and r in radians per second."""
+        return self.s[10:13]
+
     @property
-    def motor_thrust(self): return self.s[13:17]   # newtons
+    def motor_thrust(self):
+        """Return the four motor thrust values in newtons."""
+        return self.s[13:17]
 
     def euler_deg(self):
+        """Return the current roll, pitch, and yaw orientation in degrees."""
         return np.degrees(quat_to_euler(self.quat))
 
     # --------------------------------------------------------------- dynamics
     def _deriv(self, s, T_cmd):
+        """Compute the state derivative for the current state and motor commands."""
         p = self.p
         vel, q, w, T = s[3:6], s[6:10], s[10:13], s[13:17]
         F_body = np.array([0.0, 0.0, -T.sum()])
@@ -192,7 +230,7 @@ class Quad:
         return np.concatenate([vel, acc, qd, wd, Td])
 
     def step(self, u):
-        """Advance one dt. u = four throttle commands in [0, 1] (M1..M4)."""
+        """Advance the model by one timestep using four M1..M4 throttle commands."""
         u = np.clip(np.asarray(u, float), 0.0, 1.0)
         Tc = u * self.p.thrust_max_n
         h, s = self.p.dt, self.s
@@ -207,7 +245,7 @@ class Quad:
 
     # ---------------------------------------------------------------- sensors
     def imu(self):
-        """Noisy IMU (inertial measurement unit) sample: (gyro rad/s, accel m/s^2), body frame.
+        """Return one noisy body-frame IMU sample as gyro and accelerometer vectors.
 
         Accelerometer measures specific force: 0 in free-fall, -g on body z at hover.
         """
@@ -221,16 +259,19 @@ class Quad:
 
 # ====================================================================== tests
 def check(name: str, ok: bool, detail: str) -> bool:
+    """Print one self-test result and return whether the check passed."""
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}: {detail}")
     return ok
 
 
 def run_for(quad: Quad, u, seconds: float):
+    """Advance a quadcopter by the requested duration using a fixed command."""
     for _ in range(int(round(seconds / quad.p.dt))):
         quad.step(u)
 
 
 def selftest(params: Params) -> bool:
+    """Run hover, free-fall, attitude, quaternion, and sensor-noise checks."""
     p = params
     print(f"mass {p.mass*1000:.0f} g | max thrust {p.thrust_max_gf:.1f} gf/motor | "
           f"T/W {p.thrust_to_weight:.2f} | hover throttle {p.hover_throttle*100:.0f}% | "
@@ -301,6 +342,7 @@ def selftest(params: Params) -> bool:
 
 
 def print_table(p: Params) -> None:
+    """Print motor locations, spin directions, and body reaction directions."""
     print("| Motor | Position | Spin (from above) | Reaction on body | x fwd (mm) | y right (mm) |")
     print("|---|---|---|---|---|---|")
     for name, where, sx, sy, spin, s in MOTORS:
@@ -311,6 +353,7 @@ def print_table(p: Params) -> None:
 
 
 def main() -> int:
+    """Parse command-line options, run the selected report or self-test, and exit."""
     ap = argparse.ArgumentParser(description="6-DOF micro-quadcopter model (SW-1)")
     ap.add_argument("--table", action="store_true", help="print motor numbering and spin table")
     ap.add_argument("--sweep", action="store_true", help="self-test at T/W 1.5, 2.0, 3.0 (task M3)")
